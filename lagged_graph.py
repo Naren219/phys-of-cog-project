@@ -160,6 +160,198 @@ def sliding_lagged_xcorr(signal, sfreq, window_ms=40, step_ms=5, max_lag_ms=10):
     return r_tensor, lag_tensor, r0_tensor, centers_s
 
 
+def anchor_lagged_xcorr(signal, sfreq, max_lag_ms, anchor_indices):
+    """Cross-correlate each anchor channel against every other channel.
+
+    Same outputs as `lagged_xcorr`, but only entries (i, j) where i or j is an
+    anchor are computed. Non-anchor pairs are returned as 0 for r, lag, and
+    r_at_zero (so `build_directed_graph` will naturally filter them out via
+    its lag / r thresholds).
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    if signal.ndim != 2:
+        raise ValueError(f"signal must be 2D (n_ch, n_times); got {signal.shape}")
+    n_ch, n_times = signal.shape
+    anchor_indices = list(anchor_indices)
+    for a in anchor_indices:
+        if not 0 <= a < n_ch:
+            raise ValueError(f"anchor index {a} out of range for {n_ch} channels")
+
+    max_lag = int(round(max_lag_ms * 1e-3 * sfreq))
+    if max_lag < 0:
+        raise ValueError("max_lag_ms must be non-negative")
+    if max_lag >= n_times:
+        raise ValueError(
+            f"max_lag ({max_lag} samples) must be < n_times ({n_times})."
+        )
+
+    stds = signal.std(axis=1)
+    zero_var = stds == 0
+
+    lags = np.arange(-max_lag, max_lag + 1)
+    zero_idx = int(np.where(lags == 0)[0][0])
+    best_r = np.zeros((n_ch, n_ch), dtype=np.float64)
+    best_lag = np.zeros((n_ch, n_ch), dtype=np.int64)
+    r_at_zero = np.zeros((n_ch, n_ch), dtype=np.float64)
+
+    for a in anchor_indices:
+        if zero_var[a]:
+            best_r[a, a] = np.nan
+            r_at_zero[a, a] = np.nan
+        else:
+            best_r[a, a] = 1.0
+            r_at_zero[a, a] = 1.0
+
+    pair_set = set()
+    for a in anchor_indices:
+        for k in range(n_ch):
+            if k == a:
+                continue
+            pair_set.add((a, k))
+            pair_set.add((k, a))
+
+    for i, j in pair_set:
+        if zero_var[i] or zero_var[j]:
+            best_r[i, j] = np.nan
+            best_lag[i, j] = 0
+            r_at_zero[i, j] = np.nan
+            continue
+
+        r_at_lag = np.empty(lags.size, dtype=np.float64)
+        for k, tau in enumerate(lags):
+            if tau >= 0:
+                a_sig = signal[i, : n_times - tau]
+                b_sig = signal[j, tau:]
+            else:
+                a_sig = signal[i, -tau:]
+                b_sig = signal[j, : n_times + tau]
+            a_c = a_sig - a_sig.mean()
+            b_c = b_sig - b_sig.mean()
+            na = float(np.sqrt((a_c * a_c).sum()))
+            nb = float(np.sqrt((b_c * b_c).sum()))
+            if na == 0 or nb == 0:
+                r_at_lag[k] = np.nan
+                continue
+            r_at_lag[k] = float((a_c * b_c).sum() / (na * nb))
+
+        r_at_zero[i, j] = r_at_lag[zero_idx]
+
+        if np.all(np.isnan(r_at_lag)):
+            best_r[i, j] = np.nan
+            best_lag[i, j] = 0
+            continue
+        k_best = int(np.nanargmax(np.abs(r_at_lag)))
+        best_r[i, j] = r_at_lag[k_best]
+        best_lag[i, j] = int(lags[k_best])
+
+    return best_r, best_lag, r_at_zero
+
+
+def anchor_sliding_lagged_xcorr(
+    signal, sfreq, anchor_indices, window_ms=40, step_ms=5, max_lag_ms=10,
+):
+    """Sliding-window anchor-based lagged cross-correlation.
+
+    Mirrors `sliding_lagged_xcorr` but delegates to `anchor_lagged_xcorr` so
+    only anchor rows/columns are populated per window.
+    """
+    signal = np.asarray(signal)
+    if signal.ndim != 2:
+        raise ValueError(f"signal must be 2D (n_ch, n_times); got {signal.shape}")
+    n_ch, n_times = signal.shape
+
+    win = max(2, int(round(window_ms * 1e-3 * sfreq)))
+    step = max(1, int(round(step_ms * 1e-3 * sfreq)))
+    if win > n_times:
+        raise ValueError(
+            f"window_ms={window_ms} ({win} samples) exceeds signal length {n_times}."
+        )
+
+    starts = np.arange(0, n_times - win + 1, step)
+    n_windows = starts.size
+    r_tensor = np.empty((n_windows, n_ch, n_ch), dtype=np.float64)
+    lag_tensor = np.empty((n_windows, n_ch, n_ch), dtype=np.int64)
+    r0_tensor = np.empty((n_windows, n_ch, n_ch), dtype=np.float64)
+    nan_windows = 0
+
+    for w, s in enumerate(starts):
+        seg = signal[:, s : s + win]
+        try:
+            r, lag, r0 = anchor_lagged_xcorr(seg, sfreq, max_lag_ms, anchor_indices)
+        except ValueError:
+            r_tensor[w] = np.nan
+            lag_tensor[w] = 0
+            r0_tensor[w] = np.nan
+            nan_windows += 1
+            continue
+        r_tensor[w] = r
+        lag_tensor[w] = lag
+        r0_tensor[w] = r0
+        if np.isnan(r).any():
+            nan_windows += 1
+
+    if nan_windows:
+        warnings.warn(
+            f"{nan_windows}/{n_windows} windows had NaNs (zero-variance channels)."
+        )
+
+    centers_samples = starts + (win - 1) / 2.0
+    centers_s = centers_samples / sfreq
+    return r_tensor, lag_tensor, r0_tensor, centers_s
+
+
+def anchor_sliding_lagged_from_epochs(
+    epochs,
+    anchors,
+    window_ms=40,
+    step_ms=5,
+    max_lag_ms=10,
+    use="single_trial",
+    trial_idx=0,
+):
+    """Anchor-restricted version of `sliding_lagged_from_epochs`.
+
+    Parameters
+    ----------
+    anchors : sequence of str
+        Channel names to use as anchors. Only pairs (anchor, other) and
+        (other, anchor) are computed.
+
+    Returns
+    -------
+    Same as `sliding_lagged_from_epochs`. In each returned (n_ch, n_ch) slice,
+    only anchor rows/columns are populated; other entries are zero.
+    """
+    sfreq = epochs.info["sfreq"]
+    ch_names = list(epochs.ch_names)
+    anchor_indices = []
+    for a in anchors:
+        if a not in ch_names:
+            raise ValueError(f"anchor {a!r} not in channel list: {ch_names}")
+        anchor_indices.append(ch_names.index(a))
+
+    if use == "evoked":
+        signal = epochs.average().data
+    elif use == "single_trial":
+        data = epochs.get_data()
+        if not 0 <= trial_idx < data.shape[0]:
+            raise IndexError(
+                f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
+            )
+        signal = data[trial_idx]
+    else:
+        raise ValueError(
+            f"use={use!r} not recognized; expected 'single_trial' or 'evoked'."
+        )
+
+    r_tensor, lag_tensor, r0_tensor, centers_rel = anchor_sliding_lagged_xcorr(
+        signal, sfreq, anchor_indices,
+        window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+    )
+    centers_s = centers_rel + epochs.times[0]
+    return r_tensor, lag_tensor, r0_tensor, centers_s, ch_names
+
+
 def sliding_lagged_from_epochs(
     epochs,
     window_ms=40,
