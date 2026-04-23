@@ -299,11 +299,16 @@ def sliding_lagged_diff_corr_from_epochs(epochs, window_ms, step_ms, lags_sec, u
     n_lags    = len(lags_sec)
     diff_corr = np.zeros((n_windows, n_lags, n_ch, n_ch))
 
+    # In sliding_lagged_diff_corr_from_epochs, add alongside diff_corr:
+    raw_corr = np.zeros((n_windows, n_lags, n_ch, n_ch))
+    
     for w, start in enumerate(starts):
         win_data   = signal[:, start : start + win_samp]
-        normal_mat = lagged_corr_2d(win_data, lag_samps[zero_idx])  # reference
-
+        normal_mat = lagged_corr_2d(win_data, lag_samps[zero_idx])
+    
         for l, lag in enumerate(lag_samps):
-            diff_corr[w, l] = lagged_corr_2d(win_data, lag) - normal_mat
-
-    return diff_corr, window_centers_s, list(epochs.ch_names)
+            lagged_mat       = lagged_corr_2d(win_data, lag)
+            diff_corr[w, l]  = lagged_mat - normal_mat
+            raw_corr[w, l]   = lagged_mat          # ← store raw
+    
+    return diff_corr, raw_corr, window_centers_s, list(epochs.ch_names)
