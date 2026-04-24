@@ -352,6 +352,165 @@ def anchor_sliding_lagged_from_epochs(
     return r_tensor, lag_tensor, r0_tensor, centers_s, ch_names
 
 
+def anchor_pair_sliding_curves_from_epochs(
+    epochs,
+    anchor,
+    others,
+    window_ms=40,
+    step_ms=5,
+    max_lag_ms=10,
+    use="single_trial",
+    trial_idx=0,
+):
+    """Sliding-window r(tau) curves for each (anchor, other) pair.
+
+    Uses the same window / step / lag schedule as `sliding_lagged_from_epochs`,
+    so the output is a drop-in view of the exact correlations that feed
+    `build_directed_graph`: each window's full r-vs-lag profile is kept
+    instead of being collapsed to (peak r, peak lag).
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+    anchor : str
+    others : sequence of str
+    window_ms, step_ms, max_lag_ms : float
+        Match whatever values were used when building the graph.
+    use, trial_idx : see `sliding_lagged_from_epochs`.
+
+    Returns
+    -------
+    centers_s : ndarray, shape (n_windows,)
+        Window-center times in the epoch frame.
+    lags_ms : ndarray, shape (2L+1,)
+        Lag axis in milliseconds. tau > 0 means `anchor` leads `other`.
+    curves : dict[str, ndarray]
+        Maps each name in `others` to an (n_windows, 2L+1) Pearson-r tensor.
+    """
+    sfreq = epochs.info["sfreq"]
+    ch_names = list(epochs.ch_names)
+    if anchor not in ch_names:
+        raise ValueError(f"anchor {anchor!r} not in channel list.")
+    for o in others:
+        if o not in ch_names:
+            raise ValueError(f"other {o!r} not in channel list.")
+    a_idx = ch_names.index(anchor)
+    other_idxs = [ch_names.index(o) for o in others]
+
+    if use == "evoked":
+        signal = epochs.average().data
+    elif use == "single_trial":
+        data = epochs.get_data()
+        if not 0 <= trial_idx < data.shape[0]:
+            raise IndexError(
+                f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
+            )
+        signal = data[trial_idx]
+    else:
+        raise ValueError(
+            f"use={use!r} not recognized; expected 'single_trial' or 'evoked'."
+        )
+
+    signal = np.asarray(signal, dtype=np.float64)
+    _, n_times = signal.shape
+    win = max(2, int(round(window_ms * 1e-3 * sfreq)))
+    step = max(1, int(round(step_ms * 1e-3 * sfreq)))
+    max_lag = int(round(max_lag_ms * 1e-3 * sfreq))
+    if max_lag < 0:
+        raise ValueError("max_lag_ms must be non-negative")
+    if max_lag >= win:
+        raise ValueError(
+            f"max_lag ({max_lag} samples) must be < window ({win} samples)."
+        )
+    if win > n_times:
+        raise ValueError(
+            f"window ({win} samples) exceeds signal length {n_times}."
+        )
+
+    starts = np.arange(0, n_times - win + 1, step)
+    n_windows = starts.size
+    lags = np.arange(-max_lag, max_lag + 1)
+    lags_ms = lags * 1000.0 / sfreq
+    curves = {o: np.full((n_windows, lags.size), np.nan) for o in others}
+
+    for w, s in enumerate(starts):
+        seg = signal[:, s : s + win]
+        x = seg[a_idx]
+        for o_name, j in zip(others, other_idxs):
+            y = seg[j]
+            for k, tau in enumerate(lags):
+                if tau >= 0:
+                    a = x[: win - tau]
+                    b = y[tau:]
+                else:
+                    a = x[-tau:]
+                    b = y[: win + tau]
+                a_c = a - a.mean()
+                b_c = b - b.mean()
+                na = float(np.sqrt((a_c * a_c).sum()))
+                nb = float(np.sqrt((b_c * b_c).sum()))
+                if na == 0 or nb == 0:
+                    continue
+                curves[o_name][w, k] = float((a_c * b_c).sum() / (na * nb))
+
+    centers_samples = starts + (win - 1) / 2.0
+    centers_s = centers_samples / sfreq + epochs.times[0]
+    return centers_s, lags_ms, curves
+
+
+def draw_sliding_lag_heatmaps(centers_s, lags_ms, curves, anchor, ncols=3, vmax=None):
+    """One heatmap per pair: x=window-center time, y=lag, color=r.
+
+    Each panel is the raw r(tau, t) tensor that the graph layer collapses to
+    (peak r, peak lag). A consistent ridge above tau=0 means anchor leads;
+    below, anchor lags; multiple parallel bands indicate oscillatory coupling.
+    """
+    import matplotlib.pyplot as plt
+
+    others = list(curves.keys())
+    n = len(others)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4 * ncols, 2.8 * nrows),
+        sharex=True, sharey=True,
+    )
+    axes = np.atleast_2d(axes).ravel()
+
+    t_ms = np.asarray(centers_s) * 1000.0
+    if vmax is None:
+        vmax = 0.1
+        for c in curves.values():
+            m = np.nanmax(np.abs(c)) if np.any(np.isfinite(c)) else 0.0
+            vmax = max(vmax, float(m))
+
+    im = None
+    for k, other in enumerate(others):
+        ax = axes[k]
+        im = ax.imshow(
+            curves[other].T, aspect="auto", origin="lower",
+            extent=[t_ms[0], t_ms[-1], lags_ms[0], lags_ms[-1]],
+            cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest",
+        )
+        ax.axhline(0, color="k", lw=0.5, ls=":")
+        ax.set_title(f"{anchor} vs {other}", fontsize=9)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+    for ax in axes[-ncols:]:
+        ax.set_xlabel("window center (ms)")
+    for ax in axes[::ncols]:
+        ax.set_ylabel("lag (ms)  (+ = anchor leads)")
+
+    fig.suptitle(
+        f"Sliding lagged correlation r(tau, t) - anchor {anchor}", fontsize=11,
+    )
+    fig.tight_layout(rect=[0, 0, 0.92, 0.96])
+    if im is not None:
+        cax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
+        fig.colorbar(im, cax=cax, label="r")
+    return fig
+
+
 def sliding_lagged_from_epochs(
     epochs,
     window_ms=40,
