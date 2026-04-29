@@ -314,3 +314,79 @@ def summary_metrics(corr_tensor, density_thresh=0.5):
         "global_mean_r": global_mean_r,
         "density": density,
     }
+
+def lagged_corr_2d(win_data, lag_samples):
+    """
+    win_data    : (n_channels, n_times)
+    lag_samples : int  (positive = cols lag behind rows)
+
+    Returns     : (n_channels, n_channels)  asymmetric matrix
+                  corr[i, j] = correlation of ch_i (normal) with ch_j (lagged)
+    """
+    L = abs(lag_samples)
+    if lag_samples == 0:
+        normal = win_data
+        lagged = win_data
+    elif lag_samples > 0:
+        normal = win_data[:,  L:]          # chop L samples from start
+        lagged = win_data[:, :-L]         # chop L samples from end
+    else:
+        normal = win_data[:, :-L]
+        lagged = win_data[:,  L:]
+
+    def znorm(x):
+        return (x - x.mean(axis=-1, keepdims=True)) / (x.std(axis=-1, keepdims=True) + 1e-12)
+
+    return (znorm(normal) @ znorm(lagged).T) / normal.shape[-1]
+
+def sliding_lagged_diff_corr_from_epochs(epochs, window_ms, step_ms, lags_sec, use="evoked"):
+    """
+    Same interface as sliding_corr_from_epochs, extended with lags.
+
+    Returns
+    -------
+    diff_corr        : (n_windows, n_lags, n_ch, n_ch)
+                       lagged_corr - zero_lag_corr for each window & lag
+    window_centers_s : (n_windows,)
+    ch_names         : list[str]
+    """
+    if use != "evoked":
+        raise NotImplementedError(f"use={use!r} not implemented yet.")
+
+    evoked  = epochs.average()
+    signal  = evoked.data                          # (n_ch, n_times)
+    sfreq   = epochs.info["sfreq"]
+    n_ch, n_times = signal.shape
+
+    win_samp  = int(round(window_ms * sfreq / 1000))
+    step_samp = int(round(step_ms   * sfreq / 1000))
+    lag_samps = np.round(np.array(lags_sec) * sfreq).astype(int)
+
+    #max_lag = win_samp // 2
+    #assert np.all(np.abs(lag_samps) < max_lag), (
+    #    f"Lags must be < half the window. "
+    #    f"Max allowed: ±{max_lag/sfreq:.3f}s  (window={window_ms}ms)"
+    #)
+
+    starts           = np.arange(0, n_times - win_samp + 1, step_samp)
+    centers_rel      = (starts + win_samp // 2) / sfreq
+    window_centers_s = centers_rel + epochs.times[0]  # match original time frame
+
+    zero_idx  = np.argmin(np.abs(lag_samps))           # index of lag ≈ 0
+    n_windows = len(starts)
+    n_lags    = len(lags_sec)
+    diff_corr = np.zeros((n_windows, n_lags, n_ch, n_ch))
+
+    # In sliding_lagged_diff_corr_from_epochs, add alongside diff_corr:
+    raw_corr = np.zeros((n_windows, n_lags, n_ch, n_ch))
+    
+    for w, start in enumerate(starts):
+        win_data   = signal[:, start : start + win_samp]
+        normal_mat = lagged_corr_2d(win_data, lag_samps[zero_idx])
+    
+        for l, lag in enumerate(lag_samps):
+            lagged_mat       = lagged_corr_2d(win_data, lag)
+            diff_corr[w, l]  = lagged_mat - normal_mat
+            raw_corr[w, l]   = lagged_mat          # ← store raw
+    
+    return diff_corr, raw_corr, window_centers_s, list(epochs.ch_names)
