@@ -332,6 +332,10 @@ def anchor_sliding_lagged_from_epochs(
 
     if use == "evoked":
         signal = epochs.average().data
+        r_tensor, lag_tensor, r0_tensor, centers_rel = anchor_sliding_lagged_xcorr(
+            signal, sfreq, anchor_indices,
+            window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+        )
     elif use == "single_trial":
         data = epochs.get_data()
         if not 0 <= trial_idx < data.shape[0]:
@@ -339,15 +343,28 @@ def anchor_sliding_lagged_from_epochs(
                 f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
             )
         signal = data[trial_idx]
+        r_tensor, lag_tensor, r0_tensor, centers_rel = anchor_sliding_lagged_xcorr(
+            signal, sfreq, anchor_indices,
+            window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+        )
+    elif use == "trial_average":
+        n_ch = len(ch_names)
+        anchor_set = set(anchor_indices)
+        pair_indices = [
+            (i, j) for i in range(n_ch) for j in range(n_ch)
+            if i in anchor_set or j in anchor_set
+        ]
+        r_full_avg, lags, centers_rel = trial_averaged_sliding_lagged(
+            epochs.get_data(), sfreq,
+            window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+            pair_indices=pair_indices,
+        )
+        r_tensor, lag_tensor, r0_tensor = _collapse_full_to_peak(r_full_avg, lags)
     else:
         raise ValueError(
-            f"use={use!r} not recognized; expected 'single_trial' or 'evoked'."
+            f"use={use!r} not recognized; expected 'single_trial', 'evoked', or 'trial_average'."
         )
 
-    r_tensor, lag_tensor, r0_tensor, centers_rel = anchor_sliding_lagged_xcorr(
-        signal, sfreq, anchor_indices,
-        window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
-    )
     centers_s = centers_rel + epochs.times[0]
     return r_tensor, lag_tensor, r0_tensor, centers_s, ch_names
 
@@ -397,22 +414,6 @@ def anchor_pair_sliding_curves_from_epochs(
     a_idx = ch_names.index(anchor)
     other_idxs = [ch_names.index(o) for o in others]
 
-    if use == "evoked":
-        signal = epochs.average().data
-    elif use == "single_trial":
-        data = epochs.get_data()
-        if not 0 <= trial_idx < data.shape[0]:
-            raise IndexError(
-                f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
-            )
-        signal = data[trial_idx]
-    else:
-        raise ValueError(
-            f"use={use!r} not recognized; expected 'single_trial' or 'evoked'."
-        )
-
-    signal = np.asarray(signal, dtype=np.float64)
-    _, n_times = signal.shape
     win = max(2, int(round(window_ms * 1e-3 * sfreq)))
     step = max(1, int(round(step_ms * 1e-3 * sfreq)))
     max_lag = int(round(max_lag_ms * 1e-3 * sfreq))
@@ -422,37 +423,79 @@ def anchor_pair_sliding_curves_from_epochs(
         raise ValueError(
             f"max_lag ({max_lag} samples) must be < window ({win} samples)."
         )
-    if win > n_times:
+
+    def _curves_for_signal(signal):
+        signal = np.asarray(signal, dtype=np.float64)
+        _, n_times = signal.shape
+        if win > n_times:
+            raise ValueError(
+                f"window ({win} samples) exceeds signal length {n_times}."
+            )
+        starts = np.arange(0, n_times - win + 1, step)
+        lags = np.arange(-max_lag, max_lag + 1)
+        curves = {o: np.full((starts.size, lags.size), np.nan) for o in others}
+        for w, s in enumerate(starts):
+            seg = signal[:, s : s + win]
+            x = seg[a_idx]
+            for o_name, j in zip(others, other_idxs):
+                y = seg[j]
+                for k, tau in enumerate(lags):
+                    if tau >= 0:
+                        a = x[: win - tau]
+                        b = y[tau:]
+                    else:
+                        a = x[-tau:]
+                        b = y[: win + tau]
+                    a_c = a - a.mean()
+                    b_c = b - b.mean()
+                    na = float(np.sqrt((a_c * a_c).sum()))
+                    nb = float(np.sqrt((b_c * b_c).sum()))
+                    if na == 0 or nb == 0:
+                        continue
+                    curves[o_name][w, k] = float((a_c * b_c).sum() / (na * nb))
+        return curves, starts, lags
+
+    if use == "evoked":
+        curves, starts, lags = _curves_for_signal(epochs.average().data)
+    elif use == "single_trial":
+        data = epochs.get_data()
+        if not 0 <= trial_idx < data.shape[0]:
+            raise IndexError(
+                f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
+            )
+        curves, starts, lags = _curves_for_signal(data[trial_idx])
+    elif use == "trial_average":
+        data = epochs.get_data()
+        n_trials = data.shape[0]
+        if n_trials == 0:
+            raise ValueError("epochs has zero trials.")
+        eps = 1e-6
+        sum_z = None
+        cnt = None
+        starts = lags = None
+        for t in range(n_trials):
+            curves_t, starts_t, lags_t = _curves_for_signal(data[t])
+            if sum_z is None:
+                starts = starts_t
+                lags = lags_t
+                sum_z = {o: np.zeros_like(c) for o, c in curves_t.items()}
+                cnt = {o: np.zeros_like(c, dtype=np.int64) for o, c in curves_t.items()}
+            for o, c in curves_t.items():
+                finite = np.isfinite(c)
+                z = np.arctanh(np.clip(c, -1.0 + eps, 1.0 - eps))
+                sum_z[o] += np.where(finite, z, 0.0)
+                cnt[o] += finite.astype(np.int64)
+        curves = {}
+        for o in sum_z:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                z_mean = np.where(cnt[o] > 0, sum_z[o] / np.maximum(cnt[o], 1), np.nan)
+            curves[o] = np.tanh(z_mean)
+    else:
         raise ValueError(
-            f"window ({win} samples) exceeds signal length {n_times}."
+            f"use={use!r} not recognized; expected 'single_trial', 'evoked', or 'trial_average'."
         )
 
-    starts = np.arange(0, n_times - win + 1, step)
-    n_windows = starts.size
-    lags = np.arange(-max_lag, max_lag + 1)
     lags_ms = lags * 1000.0 / sfreq
-    curves = {o: np.full((n_windows, lags.size), np.nan) for o in others}
-
-    for w, s in enumerate(starts):
-        seg = signal[:, s : s + win]
-        x = seg[a_idx]
-        for o_name, j in zip(others, other_idxs):
-            y = seg[j]
-            for k, tau in enumerate(lags):
-                if tau >= 0:
-                    a = x[: win - tau]
-                    b = y[tau:]
-                else:
-                    a = x[-tau:]
-                    b = y[: win + tau]
-                a_c = a - a.mean()
-                b_c = b - b.mean()
-                na = float(np.sqrt((a_c * a_c).sum()))
-                nb = float(np.sqrt((b_c * b_c).sum()))
-                if na == 0 or nb == 0:
-                    continue
-                curves[o_name][w, k] = float((a_c * b_c).sum() / (na * nb))
-
     centers_samples = starts + (win - 1) / 2.0
     centers_s = centers_samples / sfreq + epochs.times[0]
     return centers_s, lags_ms, curves
@@ -511,6 +554,205 @@ def draw_sliding_lag_heatmaps(centers_s, lags_ms, curves, anchor, ncols=3, vmax=
     return fig
 
 
+def lagged_xcorr_full(signal, sfreq, max_lag_ms, pair_indices=None):
+    """Full r-at-lag tensor per channel pair (no peak collapse).
+
+    Same machinery as `lagged_xcorr` but retains the entire lag axis. Pairs not
+    in `pair_indices` (if given) are left as NaN. Used by the trial-averaging
+    path, which needs r(tau) per trial to Fisher-z average before collapsing.
+
+    Returns
+    -------
+    r_full : ndarray, shape (n_ch, n_ch, 2L+1)
+        NaN for non-computed pairs and for pairs with a zero-variance channel.
+    lags : ndarray, shape (2L+1,), int
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    if signal.ndim != 2:
+        raise ValueError(f"signal must be 2D (n_ch, n_times); got {signal.shape}")
+    n_ch, n_times = signal.shape
+
+    max_lag = int(round(max_lag_ms * 1e-3 * sfreq))
+    if max_lag < 0:
+        raise ValueError("max_lag_ms must be non-negative")
+    if max_lag >= n_times:
+        raise ValueError(
+            f"max_lag ({max_lag} samples) must be < n_times ({n_times})."
+        )
+
+    lags = np.arange(-max_lag, max_lag + 1)
+    r_full = np.full((n_ch, n_ch, lags.size), np.nan, dtype=np.float64)
+
+    if pair_indices is None:
+        pairs = [(i, j) for i in range(n_ch) for j in range(n_ch)]
+    else:
+        pairs = list(pair_indices)
+
+    stds = signal.std(axis=1)
+    zero_var = stds == 0
+
+    for i, j in pairs:
+        if i == j:
+            r_full[i, j, :] = 1.0 if not zero_var[i] else np.nan
+            continue
+        if zero_var[i] or zero_var[j]:
+            continue
+        for k, tau in enumerate(lags):
+            if tau >= 0:
+                a = signal[i, : n_times - tau]
+                b = signal[j, tau:]
+            else:
+                a = signal[i, -tau:]
+                b = signal[j, : n_times + tau]
+            a_c = a - a.mean()
+            b_c = b - b.mean()
+            na = float(np.sqrt((a_c * a_c).sum()))
+            nb = float(np.sqrt((b_c * b_c).sum()))
+            if na == 0 or nb == 0:
+                continue
+            r_full[i, j, k] = float((a_c * b_c).sum() / (na * nb))
+    return r_full, lags
+
+
+def sliding_lagged_xcorr_full(
+    signal, sfreq, window_ms=40, step_ms=5, max_lag_ms=10, pair_indices=None,
+):
+    """Sliding-window version of `lagged_xcorr_full`.
+
+    Returns
+    -------
+    r_tensor_full : ndarray, shape (n_windows, n_ch, n_ch, 2L+1)
+    lags : ndarray, shape (2L+1,)
+    centers_s : ndarray, shape (n_windows,)
+        Window-center times relative to sample 0 of `signal`.
+    """
+    signal = np.asarray(signal)
+    if signal.ndim != 2:
+        raise ValueError(f"signal must be 2D (n_ch, n_times); got {signal.shape}")
+    n_ch, n_times = signal.shape
+
+    win = max(2, int(round(window_ms * 1e-3 * sfreq)))
+    step = max(1, int(round(step_ms * 1e-3 * sfreq)))
+    if win > n_times:
+        raise ValueError(
+            f"window_ms={window_ms} ({win} samples) exceeds signal length {n_times}."
+        )
+
+    starts = np.arange(0, n_times - win + 1, step)
+    n_windows = starts.size
+    max_lag = int(round(max_lag_ms * 1e-3 * sfreq))
+    n_lags = 2 * max_lag + 1
+    r_tensor_full = np.full((n_windows, n_ch, n_ch, n_lags), np.nan, dtype=np.float64)
+    lags = np.arange(-max_lag, max_lag + 1)
+
+    for w, s in enumerate(starts):
+        seg = signal[:, s : s + win]
+        try:
+            r_full, _ = lagged_xcorr_full(seg, sfreq, max_lag_ms, pair_indices=pair_indices)
+        except ValueError:
+            continue
+        r_tensor_full[w] = r_full
+
+    centers_samples = starts + (win - 1) / 2.0
+    centers_s = centers_samples / sfreq
+    return r_tensor_full, lags, centers_s
+
+
+def trial_averaged_sliding_lagged(
+    per_trial_data, sfreq, window_ms=40, step_ms=5, max_lag_ms=10, pair_indices=None,
+):
+    """Per-trial sliding lagged Pearson r → Fisher-z transform → average across trials.
+
+    For each trial we compute the full r(tau, t, i, j) tensor, apply Fisher-z
+    (`arctanh`), accumulate across trials, then back-transform with `tanh`. NaNs
+    (zero-variance channels, etc.) are skipped per cell — the mean uses only
+    trials where that cell was finite. Inputs are clipped to [-1+eps, 1-eps]
+    before `arctanh` to avoid singularities at |r| = 1.
+
+    Parameters
+    ----------
+    per_trial_data : ndarray, shape (n_trials, n_ch, n_times)
+
+    Returns
+    -------
+    r_full_avg : ndarray, shape (n_windows, n_ch, n_ch, 2L+1)
+        Fisher-z averaged r at each lag, back-transformed to r-scale. NaN where
+        no trial had a finite value.
+    lags : ndarray, shape (2L+1,)
+    centers_s : ndarray, shape (n_windows,)
+    """
+    per_trial_data = np.asarray(per_trial_data, dtype=np.float64)
+    if per_trial_data.ndim != 3:
+        raise ValueError(
+            f"per_trial_data must be 3D (n_trials, n_ch, n_times); got {per_trial_data.shape}"
+        )
+    n_trials = per_trial_data.shape[0]
+    if n_trials == 0:
+        raise ValueError("per_trial_data has zero trials.")
+
+    sum_z = None
+    cnt = None
+    lags = None
+    centers_s = None
+    eps = 1e-6
+
+    for t in range(n_trials):
+        r_full, lags_t, centers_t = sliding_lagged_xcorr_full(
+            per_trial_data[t], sfreq,
+            window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+            pair_indices=pair_indices,
+        )
+        if sum_z is None:
+            lags = lags_t
+            centers_s = centers_t
+            sum_z = np.zeros_like(r_full)
+            cnt = np.zeros(r_full.shape, dtype=np.int64)
+
+        finite = np.isfinite(r_full)
+        z = np.arctanh(np.clip(r_full, -1.0 + eps, 1.0 - eps))
+        sum_z += np.where(finite, z, 0.0)
+        cnt += finite.astype(np.int64)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z_mean = np.where(cnt > 0, sum_z / np.maximum(cnt, 1), np.nan)
+    return np.tanh(z_mean), lags, centers_s
+
+
+def _collapse_full_to_peak(r_full, lags):
+    """Collapse the lag axis of a full r tensor to (best_r, best_lag, r_at_zero).
+
+    Output shape matches `sliding_lagged_xcorr` so trial-averaged tensors are
+    drop-in compatible with `build_directed_graph`.
+
+    Parameters
+    ----------
+    r_full : ndarray, shape (..., 2L+1)
+    lags : ndarray, shape (2L+1,)
+
+    Returns
+    -------
+    best_r : ndarray, shape (...,) — signed r at peak |r|, NaN if all-NaN slice
+    best_lag : ndarray, shape (...,), int — lag in samples at peak |r|; 0 if all-NaN
+    r_at_zero : ndarray, shape (...,) — r at lag = 0
+    """
+    r_full = np.asarray(r_full)
+    lags = np.asarray(lags)
+    zero_idx = int(np.where(lags == 0)[0][0])
+    r_at_zero = r_full[..., zero_idx].copy()
+
+    abs_r = np.abs(r_full)
+    all_nan = np.all(~np.isfinite(r_full), axis=-1)
+    abs_r_safe = np.where(np.isfinite(abs_r), abs_r, -np.inf)
+    k_best = np.argmax(abs_r_safe, axis=-1)
+
+    best_r = np.take_along_axis(r_full, k_best[..., None], axis=-1).squeeze(-1)
+    best_lag = lags[k_best]
+
+    best_r = np.where(all_nan, np.nan, best_r)
+    best_lag = np.where(all_nan, 0, best_lag).astype(np.int64)
+    return best_r, best_lag, r_at_zero
+
+
 def sliding_lagged_from_epochs(
     epochs,
     window_ms=40,
@@ -524,11 +766,13 @@ def sliding_lagged_from_epochs(
     Parameters
     ----------
     epochs : mne.Epochs
-    use : {'single_trial', 'evoked'}
+    use : {'single_trial', 'evoked', 'trial_average'}
         'single_trial' selects one trial by `trial_idx`.
-        'evoked' uses the trial-averaged signal.
+        'evoked' uses the trial-averaged signal, then correlates.
+        'trial_average' computes lagged r per trial, Fisher-z transforms, then
+        averages across trials before collapsing to (peak r, peak lag).
     trial_idx : int
-        Required when use='single_trial'.
+        Required when use='single_trial'; ignored otherwise.
 
     Returns
     -------
@@ -541,6 +785,9 @@ def sliding_lagged_from_epochs(
 
     if use == "evoked":
         signal = epochs.average().data
+        r_tensor, lag_tensor, r0_tensor, centers_rel = sliding_lagged_xcorr(
+            signal, sfreq, window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms
+        )
     elif use == "single_trial":
         data = epochs.get_data()
         if not (0 <= trial_idx < data.shape[0]):
@@ -548,12 +795,20 @@ def sliding_lagged_from_epochs(
                 f"trial_idx={trial_idx} out of range for {data.shape[0]} trials."
             )
         signal = data[trial_idx]
+        r_tensor, lag_tensor, r0_tensor, centers_rel = sliding_lagged_xcorr(
+            signal, sfreq, window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms
+        )
+    elif use == "trial_average":
+        r_full_avg, lags, centers_rel = trial_averaged_sliding_lagged(
+            epochs.get_data(), sfreq,
+            window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms,
+        )
+        r_tensor, lag_tensor, r0_tensor = _collapse_full_to_peak(r_full_avg, lags)
     else:
-        raise ValueError(f"use={use!r} not recognized; expected 'single_trial' or 'evoked'.")
+        raise ValueError(
+            f"use={use!r} not recognized; expected 'single_trial', 'evoked', or 'trial_average'."
+        )
 
-    r_tensor, lag_tensor, r0_tensor, centers_rel = sliding_lagged_xcorr(
-        signal, sfreq, window_ms=window_ms, step_ms=step_ms, max_lag_ms=max_lag_ms
-    )
     centers_s = centers_rel + epochs.times[0]
     return r_tensor, lag_tensor, r0_tensor, centers_s, list(epochs.ch_names)
 
@@ -858,3 +1113,30 @@ if __name__ == "__main__":
     assert abs(r[0, 1]) - abs(r0[0, 1]) > 0.2, (r[0, 1], r0[0, 1])
     print("Sanity check passed: ch0 leads ch1 by", shift, "samples.")
     print(f"  lag-gain[0,1] = {abs(r[0, 1]) - abs(r0[0, 1]):.3f}")
+
+    # Trial-averaged Fisher-z sanity: build N trials with the same shift but
+    # independent additive noise, verify recovery of lag = +shift on average.
+    n_trials = 20
+    noise_sd = 0.5
+    per_trial = np.empty((n_trials, 2, n_times), dtype=np.float64)
+    for t in range(n_trials):
+        b = rng.standard_normal(n_times + shift)
+        c1 = b[:n_times] + noise_sd * rng.standard_normal(n_times)
+        c0 = b[shift : shift + n_times] + noise_sd * rng.standard_normal(n_times)
+        per_trial[t] = np.stack([c0, c1], axis=0)
+
+    r_full_avg, lags_arr, _centers = trial_averaged_sliding_lagged(
+        per_trial, sfreq, window_ms=200.0, step_ms=100.0, max_lag_ms=20.0,
+    )
+    r_avg, lag_avg, r0_avg = _collapse_full_to_peak(r_full_avg, lags_arr)
+    # All windows should recover lag = +shift for (0, 1).
+    assert np.all(lag_avg[:, 0, 1] == shift), lag_avg[:, 0, 1]
+    assert np.all(lag_avg[:, 1, 0] == -shift), lag_avg[:, 1, 0]
+    # r_at_zero should be lower than peak r on average (real lag-gain).
+    gains = np.abs(r_avg[:, 0, 1]) - np.abs(r0_avg[:, 0, 1])
+    assert np.mean(gains) > 0.05, gains
+    print(
+        f"Trial-averaged Fisher-z sanity: lag recovered = {shift}, "
+        f"mean |r_peak|={np.mean(np.abs(r_avg[:, 0, 1])):.3f}, "
+        f"mean lag-gain={np.mean(gains):.3f}"
+    )
