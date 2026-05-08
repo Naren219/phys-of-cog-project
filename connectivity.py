@@ -209,6 +209,84 @@ def draw_roi_heatmap(ax, matrix, boundaries, labels, vmin=-1, vmax=1,
     return im
 
 
+def roi_average_anchor_r(r_tensor, ch_names, anchor):
+    """Mean anchor-vs-other peak r within each scalp ROI, per window.
+
+    Parameters
+    ----------
+    r_tensor : ndarray, shape (n_windows, n_ch, n_ch)
+        Signed peak-r from a lagged xcorr run (full or anchor variant).
+    ch_names : list[str]
+    anchor : str
+        Channel name; excluded from its own ROI mean.
+
+    Returns
+    -------
+    rois : list[str]
+        ROIs (in ROI_DISPLAY_ORDER) with >=1 non-anchor channel.
+    mean_r : ndarray, shape (n_rois, n_windows)
+    mean_abs_r : ndarray, shape (n_rois, n_windows)
+    counts : list[int]
+    """
+    anchor_idx = ch_names.index(anchor)
+    roi_per_ch = [_assign_roi(c) for c in ch_names]
+
+    rois, mean_r, mean_abs_r, counts = [], [], [], []
+    for roi in ROI_DISPLAY_ORDER:
+        idxs = [i for i, r in enumerate(roi_per_ch)
+                if r == roi and i != anchor_idx]
+        if not idxs:
+            continue
+        vals = r_tensor[:, anchor_idx, idxs]
+        rois.append(roi)
+        mean_r.append(np.nanmean(vals, axis=1))
+        mean_abs_r.append(np.nanmean(np.abs(vals), axis=1))
+        counts.append(len(idxs))
+    return rois, np.asarray(mean_r), np.asarray(mean_abs_r), counts
+
+
+def draw_roi_anchor_timeseries(r_tensor, centers_s, ch_names, anchor, ncols=3):
+    """One-panel-per-ROI time series of anchor's ROI-averaged peak r.
+
+    Solid line = signed mean r across ROI channels; dashed = mean |r|.
+    Reduces single-electrode noise to group-level coupling.
+    """
+    import matplotlib.pyplot as plt
+
+    rois, mean_r, mean_abs_r, counts = roi_average_anchor_r(
+        r_tensor, ch_names, anchor
+    )
+    n = len(rois)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4 * ncols, 2.6 * nrows),
+        sharex=True, sharey=True,
+    )
+    axes = np.atleast_2d(axes).ravel()
+    t_ms = np.asarray(centers_s) * 1000.0
+
+    for k, roi in enumerate(rois):
+        ax = axes[k]
+        ax.axhline(0, color="k", lw=0.5)
+        ax.plot(t_ms, mean_r[k], color="C0", lw=1.4, label="mean r")
+        ax.plot(t_ms, mean_abs_r[k], color="C3", lw=1.1, ls="--", label="mean |r|")
+        ax.set_title(f"{roi}  (n={counts[k]})", fontsize=9)
+        ax.set_ylim(-1, 1)
+        ax.grid(True, alpha=0.25)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+    for ax in axes[-ncols:]:
+        ax.set_xlabel("window center (ms)")
+    for ax in axes[::ncols]:
+        ax.set_ylabel("peak r")
+    axes[0].legend(loc="upper right", fontsize=7)
+
+    fig.suptitle(f"ROI-averaged lagged correlation - anchor {anchor}", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
 def summary_metrics(corr_tensor, density_thresh=0.5):
     """Per-window scalar summaries over the upper triangle of each corr matrix.
 
